@@ -53,10 +53,11 @@ function Show-Menu {
     Write-Host "  [3] ICMP / Pare-feu"        -ForegroundColor White
     Write-Host "  [4] Identite machine"       -ForegroundColor White
     if ($isServer) {
-        Write-Host "  [5] Roles Windows Server"                        -ForegroundColor White
-        Write-Host "  [6] Promotion DC (ADDS)"                         -ForegroundColor White
-        Write-Host "  [7] DNS - Zones inversees"                       -ForegroundColor White
+        Write-Host "  [5] Roles Windows Server"                         -ForegroundColor White
+        Write-Host "  [6] Promotion DC (ADDS)"                          -ForegroundColor White
+        Write-Host "  [7] DNS - Zones inversees"                        -ForegroundColor White
         Write-Host "  [8] Structure AD  (OUs / Groupes / Utilisateurs)" -ForegroundColor White
+        Write-Host "  [9] Configuration DHCP"                           -ForegroundColor White
     }
     Write-Host ""
     Write-Host "  [0] Tout executer"  -ForegroundColor DarkYellow
@@ -171,7 +172,7 @@ function Invoke-MachineIdentity {
     }
 
     if (Confirm-Action "Joindre un domaine Active Directory ?") {
-        $script:DomainJoined = (Read-Host "  Nom du domaine (ex: TSSR110-ML.LCL)").Trim()
+        $script:DomainJoined = (Read-Host "  Nom du domaine (ex: domaine.lcl)").Trim()
         Write-Step "Saisir les credentials du domaine..."
         $domainCred = Get-Credential
 
@@ -229,14 +230,28 @@ function Invoke-ServerRoles {
             Write-Log "Role: $label"
 
             if ($k -eq "3") {
-                $dhcpFqdn = if ($script:DomainJoined) { "$env:COMPUTERNAME.$($script:DomainJoined)" } else { $env:COMPUTERNAME }
+                $cs          = Get-CimInstance Win32_ComputerSystem
+                $partOfDomain = $cs.PartOfDomain
+                $detectedDomain = if ($partOfDomain) { $cs.Domain } else { $null }
+                $dhcpFqdn    = if ($detectedDomain) { "$env:COMPUTERNAME.$detectedDomain" } else { $env:COMPUTERNAME }
+
                 Write-Info "Pour autoriser le serveur DHCP dans AD :"
                 Write-Info "  Add-DhcpServerInDC -DnsName '$dhcpFqdn'"
-                if ($script:DomainJoined -and (Confirm-Action "Autoriser ce serveur DHCP dans AD maintenant ?")) {
-                    $cred3 = Get-Credential "Compte admin du domaine"
-                    Add-DhcpServerInDC -DnsName $dhcpFqdn -Credential $cred3 -ErrorAction SilentlyContinue
-                    Write-OK "Serveur DHCP autorise dans AD"
-                    Write-Log "DHCP: autorise dans AD"
+
+                if ($partOfDomain -and (Confirm-Action "Autoriser ce serveur DHCP dans AD maintenant ?")) {
+                    if ($script:NeedReboot) {
+                        Write-Warn "Un redemarrage est en attente (jonction domaine). L'autorisation DHCP risque d'echouer."
+                        Write-Warn "Recommande : redemarrez d'abord, puis relancez le bloc [5]."
+                        if (-not (Confirm-Action "Continuer quand meme ?")) { return }
+                    }
+                    try {
+                        Add-DhcpServerInDC -DnsName $dhcpFqdn -ErrorAction Stop
+                        Write-OK "Serveur DHCP autorise dans AD"
+                        Write-Log "DHCP: autorise dans AD"
+                    } catch {
+                        Write-Warn "Echec autorisation DHCP : $_"
+                        Write-Warn "Verifiez que le DNS pointe vers le DC et que la jonction domaine est effective (redemarrage requis ?)"
+                    }
                 }
             }
         }
@@ -261,7 +276,7 @@ function Invoke-ADDSPromotion {
 
     switch ($dcMode) {
         "1" {
-            $forest = (Read-Host "  Nom de la foret (ex: MONDOMAINE.LCL)").Trim()
+            $forest = (Read-Host "  Nom de la foret (ex: domaine.lcl)").Trim()
             Install-ADDSForest `
                 -CreateDnsDelegation:$false `
                 -DatabasePath "C:\Windows\NTDS" `
@@ -491,6 +506,69 @@ function Invoke-ADStructure {
     }
 }
 
+function Invoke-DHCPConfig {
+    Write-Banner "Configuration DHCP"
+
+    if (-not (Get-WindowsFeature -Name "DHCP").Installed) {
+        Write-Warn "Le role DHCP n'est pas installe. Lancez d'abord le bloc [5]."
+        return
+    }
+
+    do {
+        $scopeName  = (Read-Host "  Nom de l'etendue (ex: LAN-RDC)").Trim()
+        $startRange = (Read-Host "  Debut de plage (ex: 192.168.1.10)").Trim()
+        $endRange   = (Read-Host "  Fin de plage   (ex: 192.168.1.200)").Trim()
+        $subnetMask = (Read-Host "  Masque de sous-reseau (ex: 255.255.255.0)").Trim()
+        $gateway    = (Read-Host "  Passerelle (option 3)").Trim()
+        $dns        = (Read-Host "  DNS primaire (option 6)").Trim()
+        $dns2       = (Read-Host "  DNS secondaire (Entree pour ignorer)").Trim()
+        $domainName = (Read-Host "  Nom de domaine (option 15, Entree pour ignorer)").Trim()
+        $leaseDays  = (Read-Host "  Duree du bail en jours (defaut: 8)").Trim()
+        if (-not $leaseDays) { $leaseDays = "8" }
+
+        Write-Step "Creation de l'etendue '$scopeName'..."
+
+        try {
+            Add-DhcpServerv4Scope `
+                -Name          $scopeName `
+                -StartRange    $startRange `
+                -EndRange      $endRange `
+                -SubnetMask    $subnetMask `
+                -LeaseDuration ([TimeSpan]::FromDays([int]$leaseDays)) `
+                -State         Active `
+                -ErrorAction   Stop
+            Write-OK "Etendue creee et activee : $startRange - $endRange"
+            Write-Log "DHCP: etendue $scopeName $startRange-$endRange"
+        } catch {
+            Write-Warn "Erreur creation etendue : $_"
+            continue
+        }
+
+        $scopeId = (Get-DhcpServerv4Scope | Where-Object { $_.Name -eq $scopeName }).ScopeId.IPAddressToString
+
+        if (Confirm-Action "Ajouter des exclusions dans cette etendue ?") {
+            while ($true) {
+                $exclStart = (Read-Host "  Debut exclusion (Entree pour terminer)").Trim()
+                if (-not $exclStart) { break }
+                $exclEnd = (Read-Host "  Fin exclusion").Trim()
+                Add-DhcpServerv4ExclusionRange -ScopeId $scopeId -StartRange $exclStart -EndRange $exclEnd -ErrorAction SilentlyContinue
+                Write-OK "Exclusion ajoutee : $exclStart - $exclEnd"
+            }
+        }
+
+        $dnsServers = if ($dns2) { @($dns, $dns2) } else { @($dns) }
+        Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId 3  -Value $gateway    -ErrorAction SilentlyContinue
+        Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId 6  -Value $dnsServers -ErrorAction SilentlyContinue
+        if ($domainName) {
+            Set-DhcpServerv4OptionValue -ScopeId $scopeId -OptionId 15 -Value $domainName -ErrorAction SilentlyContinue
+        }
+
+        Write-OK "Options configurees : GW=$gateway  DNS=$($dnsServers -join ', ')"
+        Write-Log "DHCP: options scopeId=$scopeId gw=$gateway dns=$($dnsServers -join ',')"
+
+    } while (Confirm-Action "Ajouter une autre etendue ?")
+}
+
 function Invoke-All {
     Invoke-VirtIO
     Invoke-NetworkConfig
@@ -530,6 +608,7 @@ do {
         "6" { if ($isServer) { Invoke-ADDSPromotion }    else { Write-Warn "Option reservee aux serveurs" } }
         "7" { if ($isServer) { Invoke-DNSReverseZones }  else { Write-Warn "Option reservee aux serveurs" } }
         "8" { if ($isServer) { Invoke-ADStructure }      else { Write-Warn "Option reservee aux serveurs" } }
+        "9" { if ($isServer) { Invoke-DHCPConfig }        else { Write-Warn "Option reservee aux serveurs" } }
         "0" { Invoke-All }
         "Q" { }
         default { Write-Warn "Choix invalide" }
