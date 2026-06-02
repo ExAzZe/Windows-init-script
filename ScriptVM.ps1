@@ -427,15 +427,27 @@ function Invoke-ADStructure {
         Write-Step "Creation des utilisateurs depuis AD-Users.csv..."
         $users = Import-Csv $userCsv
 
+        $hasPasswordCol = ($users | Select-Object -First 1).PSObject.Properties['Password']
+        $defaultSecPwd  = $null
+
+        if (-not $hasPasswordCol) {
+            Write-Warn "Aucune colonne Password dans le CSV"
+            $defaultSecPwd = Read-Host "  Mot de passe a appliquer a tous les utilisateurs" -AsSecureString
+        }
+
         foreach ($u in $users) {
             if (Get-ADUser -Filter "SamAccountName -eq '$($u.Login)'" -ErrorAction SilentlyContinue) {
                 Write-Info "Utilisateur existant : $($u.Login)"
                 continue
             }
 
-            $ouDN   = (Get-ADOrganizationalUnit -Filter "Name -eq '$($u.OU)'" -SearchBase $DN -SearchScope Subtree -ErrorAction SilentlyContinue).DistinguishedName
-            $pwd    = if ($u.Password) { $u.Password } else { "Passw0rd!" }
-            $secPwd = ConvertTo-SecureString $pwd -AsPlainText -Force
+            $ouDN = (Get-ADOrganizationalUnit -Filter "Name -eq '$($u.OU)'" -SearchBase $DN -SearchScope Subtree -ErrorAction SilentlyContinue).DistinguishedName
+
+            if ($hasPasswordCol -and $u.Password) {
+                $secPwd = ConvertTo-SecureString $u.Password -AsPlainText -Force
+            } else {
+                $secPwd = $defaultSecPwd
+            }
 
             $params = @{
                 Name                  = "$($u.Prenom) $($u.Nom)"
