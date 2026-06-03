@@ -3,7 +3,8 @@ $ErrorActionPreference = "Continue"
 
 $script:NeedReboot   = $false
 $script:DomainJoined = $null
-$script:LogFile      = "$env:SystemDrive\vm-setup-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+$isAdmin     = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$script:LogFile = if ($isAdmin) { "$env:SystemDrive\vm-setup-$(Get-Date -Format 'yyyyMMdd-HHmmss').log" } else { "$env:TEMP\vm-setup-$(Get-Date -Format 'yyyyMMdd-HHmmss').log" }
 
 $os          = Get-CimInstance Win32_OperatingSystem
 $productType = $os.ProductType
@@ -135,15 +136,19 @@ function Invoke-NetworkConfig {
 
         Write-Step "Application de la configuration sur '$alias'..."
 
-        Remove-NetIPAddress -InterfaceAlias $alias -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-NetRoute     -InterfaceAlias $alias -DestinationPrefix "0.0.0.0/0" -Confirm:$false -ErrorAction SilentlyContinue
-        New-NetIPAddress    -InterfaceAlias $alias -IPAddress $ip -PrefixLength ([int]$prefix) -DefaultGateway $gw | Out-Null
-
+        Set-NetIPInterface -InterfaceAlias $alias -Dhcp Disabled -ErrorAction SilentlyContinue
+        Get-NetIPAddress   -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-NetRoute    -InterfaceAlias $alias -DestinationPrefix "0.0.0.0/0" -Confirm:$false -ErrorAction SilentlyContinue
         $dnsServers = if ($dns2) { @($dns1, $dns2) } else { @($dns1) }
-        Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $dnsServers
 
-        Write-OK "$alias : $ip/$prefix  GW=$gw  DNS=$($dnsServers -join ', ')"
-        Write-Log "IP: alias=$alias ip=$ip/$prefix gw=$gw dns=$($dnsServers -join ',')"
+        try {
+            New-NetIPAddress -InterfaceAlias $alias -IPAddress $ip -PrefixLength ([int]$prefix) -DefaultGateway $gw -ErrorAction Stop | Out-Null
+            Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $dnsServers
+            Write-OK "$alias : $ip/$prefix  GW=$gw  DNS=$($dnsServers -join ', ')"
+            Write-Log "IP: alias=$alias ip=$ip/$prefix gw=$gw dns=$($dnsServers -join ',')"
+        } catch {
+            Write-Warn "Echec configuration IP : $_"
+        }
     }
 }
 
@@ -155,8 +160,8 @@ function Invoke-ICMPConfig {
     Write-Info "Etat actuel regle ICMP v4 : $current"
 
     if (Confirm-Action "Autoriser le ping entrant (ICMP v4) ?") {
-        Set-NetFirewallRule -Name "FPS-ICMP4-ERQ-In" -Enabled True
-        Write-OK "Regle pare-feu ICMP v4 activee"
+        Set-NetFirewallRule -Name "FPS-ICMP4-ERQ-In" -Enabled True -RemoteAddress Any
+        Write-OK "Regle pare-feu ICMP v4 activee (RemoteAddress: Any)"
         Write-Log "ICMP v4: active"
     }
 }
@@ -179,13 +184,18 @@ function Invoke-MachineIdentity {
         $addParams = @{ DomainName = $script:DomainJoined; Credential = $domainCred; Force = $true }
         if ($newComputerName) { $addParams["NewName"] = $newComputerName }
 
-        Add-Computer @addParams
-        Write-OK "Machine ajoutee au domaine '$($script:DomainJoined)'"
-        if ($newComputerName) { Write-OK "Sera renommee '$newComputerName' apres redemarrage" }
-        Write-Log "Domaine: $($script:DomainJoined) | NouveauNom=$newComputerName"
-
-        $newComputerName   = $null
-        $script:NeedReboot = $true
+        try {
+            Add-Computer @addParams -ErrorAction Stop
+            Write-OK "Machine ajoutee au domaine '$($script:DomainJoined)'"
+            if ($newComputerName) { Write-OK "Sera renommee '$newComputerName' apres redemarrage" }
+            Write-Log "Domaine: $($script:DomainJoined) | NouveauNom=$newComputerName"
+            $newComputerName   = $null
+            $script:NeedReboot = $true
+        } catch {
+            Write-Warn "Echec jonction domaine : $_"
+            Write-Warn "Verifiez que le DNS pointe vers le DC et que le domaine est joignable."
+            $script:DomainJoined = $null
+        }
     }
 
     if ($newComputerName) {
